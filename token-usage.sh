@@ -11,7 +11,7 @@
 #   ./token-usage.sh <session-id|path>   # 指定セッションのみ集計
 #   ./token-usage.sh --json              # 集計結果を JSON で出力
 #
-# 料金は 2026-07-20 時点（ブログ記事準拠）。DISABLE_PROMPT_CACHING でも usage は正しく取れます。
+# 料金は 2026-11-26 時点の公式料金表準拠。DISABLE_PROMPT_CACHING でも usage は正しく取れます。
 #
 # bash 専用（process substitution / mapfile を使うため）。
 # `sh script.sh` で起動されると macOS では bash 3.2 の POSIX モードになり
@@ -100,37 +100,100 @@ export TU_LIMIT="$LIMIT"
 export TU_JSON="$JSON_OUT"
 
 python3 - "${FILES[@]}" <<'PYEOF'
-import json, os, sys, datetime
+import json, os, re, sys, datetime
 
 DETAIL = os.environ.get("TU_DETAIL", "")
 LIMIT  = int(os.environ.get("TU_LIMIT", "0") or 0)
 JSON_OUT = os.environ.get("TU_JSON", "0") == "1"
 
-# 料金表 (USD / MTok) 2026-07-20 時点。write5m=5分cache作成, write1h=1時間cache作成
+# Pricing (USD / MTok) as of 2026-11-26, from https://platform.claude.com/docs/en/about-claude/pricing
+# w5 = 5-minute cache write, w1 = 1-hour cache write, read = cache read (hit)
+def _p(i, o, w5, w1, r):
+    return {"in": i, "out": o, "w5": w5, "w1": w1, "read": r}
+
 PRICING = {
-    "claude-opus-4-8":       {"in": 5.0,  "out": 25.0, "w5": 6.25,  "w1": 10.0, "read": 0.5},
-    "claude-sonnet-5":       {"in": 2.0,  "out": 10.0, "w5": 2.50,  "w1": 4.0,  "read": 0.2},  # ~2026/8/31 の料金
-    "claude-fable-5":        {"in": 10.0, "out": 50.0, "w5": 12.50, "w1": 20.0, "read": 1.0},
-    "claude-haiku-4-5":      {"in": 1.0,  "out": 5.0,  "w5": 1.25,  "w1": 2.0,  "read": 0.1},
-    # 旧 Opus（4.6以降は値下げ後の Opus 料金で共通、記事本文の記載に準拠）
-    "claude-opus-4-7":       {"in": 5.0,  "out": 25.0, "w5": 6.25,  "w1": 10.0, "read": 0.5},
-    "claude-opus-4-6":       {"in": 5.0,  "out": 25.0, "w5": 6.25,  "w1": 10.0, "read": 0.5},
-    # ※ claude-sonnet-4-6 等それ以前のモデルは料金未確認のため意図的に未登録（"⚠料金不明" 表示）
+    "claude-fable-5-2":  _p(8.0,  40.0, 10.0,  16.0, 0.20),
+    "claude-mythos-5-2": _p(8.0,  40.0, 10.0,  16.0, 0.20),
+    "claude-fable-5-1":  _p(10.0, 50.0, 12.50, 20.0, 0.25),
+    "claude-mythos-5-1": _p(10.0, 50.0, 12.50, 20.0, 0.25),
+    "claude-fable-5":    _p(10.0, 50.0, 12.50, 20.0, 1.00),
+    "claude-mythos-5":   _p(10.0, 50.0, 12.50, 20.0, 1.00),
+    "claude-opus-5-5":   _p(4.0,  20.0, 5.0,   8.0,  0.20),
+    "claude-opus-5":     _p(5.0,  25.0, 6.25,  10.0, 0.50),
+    "claude-opus-4-8":   _p(5.0,  25.0, 6.25,  10.0, 0.50),
+    "claude-opus-4-7":   _p(5.0,  25.0, 6.25,  10.0, 0.50),
+    "claude-opus-4-6":   _p(5.0,  25.0, 6.25,  10.0, 0.50),
+    "claude-opus-4-5":   _p(5.0,  25.0, 6.25,  10.0, 0.50),
+    "claude-opus-4-1":   _p(15.0, 75.0, 18.75, 30.0, 1.50),
+    "claude-opus-4":     _p(15.0, 75.0, 18.75, 30.0, 1.50),
+    "claude-sonnet-5-5": _p(2.0,  10.0, 2.50,  4.0,  0.10),
+    "claude-sonnet-5":   _p(2.0,  10.0, 2.50,  4.0,  0.20),
+    "claude-sonnet-4-6": _p(3.0,  15.0, 3.75,  6.0,  0.30),
+    "claude-sonnet-4-5": _p(3.0,  15.0, 3.75,  6.0,  0.30),
+    "claude-sonnet-4":   _p(3.0,  15.0, 3.75,  6.0,  0.30),
+    "claude-haiku-5-5":  _p(0.10, 0.50, 0.125, 0.20, 0.01),  # prompt <= 100K tokens
+    "claude-haiku-4-5":  _p(1.0,  5.0,  1.25,  2.0,  0.10),
 }
+
+# Haiku 5.5 is priced by prompt length: a request whose prompt (input + cache write
+# + cache read) is over 100,000 tokens pays these prices for all of its tokens.
+LONG_PROMPT_THRESHOLD = 100_000
+LONG_PROMPT_PRICING = {
+    "claude-haiku-5-5":  _p(0.50, 2.50, 0.625, 1.0,  0.05),
+}
+
+# Fast mode (usage.speed == "fast") input/output prices. Cache prices are derived by
+# applying the usual cache multipliers on top of the fast input price.
+FAST_PRICING = {
+    "claude-fable-5-2":  {"in": 16.0, "out": 80.0},
+    "claude-mythos-5-2": {"in": 16.0, "out": 80.0},
+    "claude-opus-5-5":   {"in": 8.0,  "out": 40.0},
+    "claude-opus-5":     {"in": 10.0, "out": 50.0},
+    "claude-opus-4-8":   {"in": 10.0, "out": 50.0},
+}
+
+# inference_geo "us" applies a 1.1x multiplier (Claude 4.6 and later; earlier
+# models reject the parameter, so it never appears in their logs)
+US_GEO_MULTIPLIER = 1.1
 
 # コスト計算対象外（Claude Code が内部生成する擬似メッセージ等）。料金0・警告なし
 FREE_MODELS = {"<synthetic>", "unknown", None}
+ZERO = _p(0, 0, 0, 0, 0)
 
-def price_for(model):
+def normalize_model(model):
+    # Strip a context-window suffix (claude-opus-5-5[1m]), a Bedrock-style prefix
+    # (global.anthropic.claude-opus-5-5) and a date snapshot suffix (-20251001).
+    m = re.sub(r"\[[^\]]*\]$", "", model)
+    m = re.sub(r"^(?:[a-z]+\.)?anthropic\.", "", m)
+    m = re.sub(r"-\d{8}$", "", m)
+    return m
+
+def price_for_request(model, acc, speed=None, geo=None):
+    """Price for one request after long-prompt, fast-mode and geo modifiers.
+
+    Returns (price, warning); price is None when the cost cannot be computed.
+    The model is matched exactly after normalization: a prefix match would let
+    claude-sonnet-5-5 silently borrow claude-sonnet-5's price.
+    """
     if model in FREE_MODELS:
-        return {"in":0,"out":0,"w5":0,"w1":0,"read":0}
-    if model in PRICING:
-        return PRICING[model]
-    # バージョン付き (例: claude-haiku-4-5-20251001) を前方一致で吸収
-    for k, v in PRICING.items():
-        if model.startswith(k):
-            return v
-    return None
+        return ZERO, None
+    key = normalize_model(model)
+    base = PRICING.get(key)
+    if base is None:
+        return None, "料金不明"
+    p = base
+    prompt_tokens = acc["in"] + acc["w5"] + acc["w1"] + acc["read"]
+    if key in LONG_PROMPT_PRICING and prompt_tokens > LONG_PROMPT_THRESHOLD:
+        p = LONG_PROMPT_PRICING[key]
+    if speed == "fast":
+        fp = FAST_PRICING.get(key)
+        if fp is None:
+            return None, "fast料金不明"
+        read_mult = base["read"] / base["in"]
+        p = _p(fp["in"], fp["out"], fp["in"] * 1.25, fp["in"] * 2.0, fp["in"] * read_mult)
+    if geo == "us":
+        p = {k: v * US_GEO_MULTIPLIER for k, v in p.items()}
+    return p, None
 
 def cost(u, p):
     if p is None:
@@ -177,7 +240,9 @@ for path in files:
     first_ts = last_ts = None
     first_prompt = None
     detail_rows = []
-    seen_ids = set()        # message.id の重複(ストリーミング分割)を排除
+    # Streaming writes several lines per message.id; earlier lines carry partial
+    # output_tokens, so keep the last line's usage (and the first line's timestamp).
+    messages = {}           # message.id (or line key) -> record, in first-seen order
 
     try:
         with open(path, encoding="utf-8") as fh:
@@ -212,39 +277,47 @@ for path in files:
                 usage = msg.get("usage")
                 if not usage:
                     continue
-                mid = msg.get("id")
-                if mid and mid in seen_ids:
-                    continue
-                if mid:
-                    seen_ids.add(mid)
-
-                model = msg.get("model", "unknown")
-                is_side = d.get("isSidechain", False)
-                msg_count += 1
-                if is_side:
-                    side_count += 1
-
-                acc = new_acc()
-                add_usage(acc, usage)
-                for k in total:
-                    total[k] += acc[k]
-                pm = per_model.setdefault(model, new_acc())
-                for k in pm:
-                    pm[k] += acc[k]
-
-                if DETAIL:
-                    detail_rows.append({
-                        "ts": ts, "model": model, "side": is_side,
-                        "acc": acc, "cost": cost(acc, price_for(model)),
-                    })
+                mid = msg.get("id") or f"_line{len(messages)}"
+                rec = messages.get(mid)
+                if rec is None:
+                    messages[mid] = rec = {"ts": ts}
+                rec["usage"] = usage
+                rec["model"] = msg.get("model", "unknown")
+                rec["side"] = d.get("isSidechain", False)
     except OSError:
         continue
 
+    total_cost = 0.0
+    unknown_models = []
+    for rec in messages.values():
+        model, usage = rec["model"], rec["usage"]
+        msg_count += 1
+        if rec["side"]:
+            side_count += 1
+
+        acc = new_acc()
+        add_usage(acc, usage)
+        for k in total:
+            total[k] += acc[k]
+        pm = per_model.setdefault(model, new_acc())
+        for k in pm:
+            pm[k] += acc[k]
+
+        price, warn = price_for_request(model, acc, usage.get("speed"),
+                                        usage.get("inference_geo"))
+        c = cost(acc, price)
+        total_cost += c
+        if warn and model not in unknown_models:
+            unknown_models.append(model)
+
+        if DETAIL:
+            detail_rows.append({
+                "ts": rec["ts"], "model": model, "side": rec["side"],
+                "acc": acc, "cost": c, "warn": warn,
+            })
+
     if msg_count == 0:
         continue
-
-    total_cost = sum(cost(pm, price_for(m)) for m, pm in per_model.items())
-    unknown_models = [m for m in per_model if price_for(m) is None]
 
     sessions.append({
         "sid": sid, "project": project, "path": path,
@@ -291,7 +364,8 @@ if DETAIL:
         a = r["acc"]
         tag = "*" if r["side"] else " "
         print(f"{i:>3}{tag}{t:<8} {r['model']:<18} {a['in']:>8} {a['out']:>8} "
-              f"{a['w5']:>9} {a['w1']:>9} {a['read']:>9} {r['cost']:>10.4f}")
+              f"{a['w5']:>9} {a['w1']:>9} {a['read']:>9} {r['cost']:>10.4f}"
+              + (f" ⚠{r['warn']}" if r["warn"] else ""))
     t = s["total"]
     print("-" * len(hdr))
     print(f"{'':>3} {'TOTAL':<8} {'':<18} {t['in']:>8} {t['out']:>8} "
